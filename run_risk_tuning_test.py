@@ -173,23 +173,25 @@ def main():
         pnl_normal = results["normal"]["avg_pnl_sol"]
         
         logger.info("📊 Normal Mode (Recommended for Production):")
-        logger.info(f"   Sharpe: {sharpe_normal:.2f}", end="")
+        sharpe_msg = f"   Sharpe: {sharpe_normal:.2f}"
         if 0.6 <= sharpe_normal <= 0.8:
-            logger.info(" ✅ TARGET ACHIEVED")
+            sharpe_msg += " ✅ TARGET ACHIEVED"
         elif sharpe_normal < 0.6:
-            logger.info(" ⚠️  Below target, consider risk_level='high'")
+            sharpe_msg += " ⚠️  Below target, consider risk_level='high'"
         else:
-            logger.info(" 🚀 Exceeds target, consider scaling capital")
+            sharpe_msg += " 🚀 Exceeds target, consider scaling capital"
+        logger.info(sharpe_msg)
         
-        logger.info(f"   DD: {dd_normal:.2f}%", end="")
+        dd_msg = f"   DD: {dd_normal:.2f}%"
         if 25 <= dd_normal <= 35:
-            logger.info(" ✅ ACCEPTABLE")
+            dd_msg += " ✅ ACCEPTABLE"
         elif dd_normal < 25:
-            logger.info(" ✅ Conservative")
+            dd_msg += " ✅ Conservative"
         else:
-            logger.info(" ⚠️  Higher than preferred")
+            dd_msg += " ⚠️  Higher than preferred"
+        logger.info(dd_msg)
         
-        logger.info(f"   PnL: {pnl_normal:,.0f} SOL\n")
+        logger.info(f"   PnL: {pnl_normal:,.0f} SOL")
     
     if "low" in results and "normal" in results:
         sharpe_improvement = (results["normal"]["avg_sharpe"] - results["low"]["avg_sharpe"]) / max(results["low"]["avg_sharpe"], 0.01)

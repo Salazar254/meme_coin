@@ -92,7 +92,11 @@ export class RegimeDetector {
       missRate48h,
       missRatePriorWeek,
       missRateIncrease,
-      decayingSignals,
+      decayingSignals: decayingSignals.map((s) => ({
+        signal: s.signal,
+        informationGainDrop: 1 - s.informationGain,
+        isDecaying: s.isDecaying,
+      })),
       shiftDetected,
       confidenceInDetection: this.computeConfidence(
         missRateIncrease,

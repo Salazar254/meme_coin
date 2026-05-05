@@ -2,6 +2,9 @@ import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { MarketRegime, ScorerConfig } from "./config.ts";
 import type { Logger } from "./utils/logger.ts";
+import { DeployerLookup } from "./features/deployer_lookup.ts";
+import { SequenceBuffer } from "./features/sequence_buffer.ts";
+import { OnnxRugScorer } from "./ml/onnx_scorer.ts";
 
 export interface TokenLaunchEvent {
   mint: string;
@@ -28,6 +31,8 @@ export interface TokenLaunchEvent {
   launchRatePerMinute: number;
   predictedWinProb: number;
   rewardRiskRatio: number;
+  launchPlatform?: string;
+  memeVolatilityIndex?: number;
   futureReturnPct?: number;
   synthetic?: boolean;
 }
@@ -39,6 +44,10 @@ export interface TokenRiskResult {
   regime: MarketRegime;
   reasons: string[];
   rugcheck?: RugCheckSummary;
+  timeToRugHours?: number;
+  maxDrawdownPct?: number;
+  pump2xProbability?: number;
+  uncertainty?: number;
 }
 
 export interface RugCheckSummary {
@@ -56,57 +65,67 @@ export interface RugCheckSummary {
 interface LinearModel {
   bias: number;
   weights: Record<string, number>;
-  tfjsModelUrl?: string;
   featureOrder?: string[];
 }
 
-interface TensorLike {
-  data(): Promise<Float32Array | number[]>;
-  dispose(): void;
-}
-
-interface TfLike {
-  tensor2d(values: number[][]): TensorLike;
-  loadLayersModel(url: string): Promise<{ predict(input: TensorLike): TensorLike | TensorLike[] }>;
+export interface NeuralRiskPrediction {
+  riskProbability: number;
+  timeToRugHours: number;
+  maxDrawdownPct: number;
+  pump2xProbability: number;
+  uncertainty: number;
 }
 
 const clamp = (value: number, low = 0, high = 1): number => Math.max(low, Math.min(high, value));
 const sigmoid = (value: number): number => 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, value))));
+const emptyLinearModel = (): LinearModel => ({ bias: 0, weights: {} });
 
 export class TokenRiskScorer {
   config: ScorerConfig;
   logger: Logger;
   model: LinearModel;
-  tf?: TfLike;
-  tfModel?: { predict(input: TensorLike): TensorLike | TensorLike[] };
+  onnxScorer?: OnnxRugScorer;
+  sequenceBuffer: SequenceBuffer;
+  deployerLookup?: DeployerLookup;
 
-  constructor(config: ScorerConfig, logger: Logger, model: LinearModel, tf?: TfLike, tfModel?: { predict(input: TensorLike): TensorLike | TensorLike[] }) {
+  constructor(
+    config: ScorerConfig,
+    logger: Logger,
+    model: LinearModel,
+    onnxScorer?: OnnxRugScorer,
+    sequenceBuffer = new SequenceBuffer(),
+    deployerLookup?: DeployerLookup
+  ) {
     this.config = config;
     this.logger = logger.child({ component: "token_risk_scorer" });
     this.model = model;
-    this.tf = tf;
-    this.tfModel = tfModel;
+    this.onnxScorer = onnxScorer;
+    this.sequenceBuffer = sequenceBuffer;
+    this.deployerLookup = deployerLookup;
   }
 
   static async load(modelPath: string, config: ScorerConfig, logger: Logger): Promise<TokenRiskScorer> {
     const resolvedPath = await resolveModelPath(modelPath);
-    const raw = await readFile(resolvedPath, "utf8");
+    let linearModelPath = resolvedPath;
+    if (resolvedPath.toLowerCase().endsWith(".onnx")) {
+      try {
+        const deployerLookup = await DeployerLookup.load();
+        const onnxScorer = await OnnxRugScorer.load(resolvedPath, { deployerLookup, mcPasses: 20 });
+        logger.info({ modelPath: resolvedPath }, "onnx_rug_model_loaded");
+        return new TokenRiskScorer(config, logger, emptyLinearModel(), onnxScorer, new SequenceBuffer(), deployerLookup);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.warn({ modelPath: resolvedPath, error: message }, "onnx_model_unavailable_linear_fallback");
+        linearModelPath = await resolveModelPath("rug_model.json");
+      }
+    }
+
+    const raw = await readFile(linearModelPath, "utf8");
     const parsed = JSON.parse(raw) as LinearModel;
     if (typeof parsed.bias !== "number" || typeof parsed.weights !== "object") {
       throw new Error("invalid_rug_model");
     }
-    if (parsed.tfjsModelUrl) {
-      try {
-        const tf = await import("@tensorflow/tfjs-node") as unknown as TfLike;
-        const tfModel = await tf.loadLayersModel(parsed.tfjsModelUrl);
-        logger.info({ modelPath: resolvedPath, tfjsModelUrl: parsed.tfjsModelUrl }, "tfjs_rug_model_loaded");
-        return new TokenRiskScorer(config, logger, parsed, tf, tfModel);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logger.warn({ modelPath: resolvedPath, error: message }, "tfjs_model_unavailable_linear_fallback");
-      }
-    }
-    logger.info({ modelPath: resolvedPath }, "rug_model_loaded");
+    logger.info({ modelPath: linearModelPath }, "rug_model_loaded");
     return new TokenRiskScorer(config, logger, parsed);
   }
 
@@ -144,42 +163,67 @@ export class TokenRiskScorer {
       }
     }
 
-    const riskProbability = await this.predict(event, rugcheck);
-    if (riskProbability > this.config.rugProbBlockThreshold) {
+    const prediction = await this.predictFull(event, rugcheck);
+    const riskProbability = prediction.riskProbability;
+    if (prediction.uncertainty > 0.1) {
+      reasons.push("model_uncertainty_review");
+    }
+    if (riskProbability > this.config.rugProbBlockThreshold && prediction.uncertainty < 0.05) {
       reasons.push("ml_risk_probability");
     }
 
     const regime = this.detectRegime(event, riskProbability);
-    const mlConfidence = clamp(1 - riskProbability);
+    const mlConfidence = clamp(1 - riskProbability - prediction.uncertainty);
     return {
       accepted: reasons.length === 0,
       riskProbability,
       mlConfidence,
       regime,
       reasons,
-      rugcheck
+      rugcheck,
+      timeToRugHours: prediction.timeToRugHours,
+      maxDrawdownPct: prediction.maxDrawdownPct,
+      pump2xProbability: prediction.pump2xProbability,
+      uncertainty: prediction.uncertainty
     };
   }
 
   async predict(event: TokenLaunchEvent, rugcheck?: RugCheckSummary): Promise<number> {
+    return (await this.predictFull(event, rugcheck)).riskProbability;
+  }
+
+  async predictFull(event: TokenLaunchEvent, rugcheck?: RugCheckSummary): Promise<NeuralRiskPrediction> {
     const features = this.features(event, rugcheck);
-    if (this.tf && this.tfModel && this.model.featureOrder) {
-      const input = this.tf.tensor2d([this.model.featureOrder.map((key) => features[key] || 0)]);
-      const prediction = this.tfModel.predict(input);
-      const tensor = Array.isArray(prediction) ? prediction[0] : prediction;
-      const data = await tensor.data();
-      input.dispose();
-      tensor.dispose();
-      return clamp(Number(data[0]));
+    if (this.onnxScorer) {
+      this.sequenceBuffer.updateFromEvent(event);
+      const scored = await this.onnxScorer.score({
+        features,
+        deployerId: this.deployerLookup?.idFor(event.deployer),
+        sequence: this.sequenceBuffer.sequenceFor(event.mint, event.timestamp)
+      });
+      return {
+        riskProbability: clamp(scored.rugProb),
+        timeToRugHours: scored.timeToRug,
+        maxDrawdownPct: scored.maxDrawdown,
+        pump2xProbability: clamp(scored.pump2xProb),
+        uncertainty: scored.uncertainty
+      };
     }
     let score = this.model.bias;
     for (const [key, weight] of Object.entries(this.model.weights)) {
       score += (features[key] || 0) * weight;
     }
-    return clamp(sigmoid(score));
+    return {
+      riskProbability: clamp(sigmoid(score)),
+      timeToRugHours: 24,
+      maxDrawdownPct: 0,
+      pump2xProbability: 0,
+      uncertainty: 0
+    };
   }
 
   features(event: TokenLaunchEvent, rugcheck?: RugCheckSummary): Record<string, number> {
+    const dangerSignals = rugcheck?.risks?.filter((risk) => ["danger", "critical"].includes(String(risk.level || "").toLowerCase())).length || 0;
     return {
       rugPullRisk: clamp(event.rugPullRisk),
       honeypotRisk: clamp(event.honeypotRisk),
@@ -193,7 +237,8 @@ export class TokenRiskScorer {
       volatility1m: clamp(event.volatility1m),
       lowLiquidity: clamp(1 / Math.max(event.liquiditySol, 0.05) / 5),
       lowBuyers: clamp(1 - event.uniqueBuyers / 40),
-      rugcheckScore: clamp((rugcheck?.score || 0) / 10000),
+      rugcheckLpUnlocked: rugcheck ? clamp(1 - (rugcheck.lpLockedPct ?? (rugcheck.lpLocked ? 100 : 0)) / 100) : 0,
+      rugcheckDangerSignals: clamp(dangerSignals / 4),
       rugcheckTopHolders: clamp((rugcheck?.topHoldersPct || event.topHolderPct * 100) / 100)
     };
   }
@@ -240,10 +285,15 @@ export class TokenRiskScorer {
 const resolveModelPath = async (modelPath: string): Promise<string> => {
   const candidates = [
     resolve(modelPath),
+    resolve(`${modelPath}.onnx`),
     resolve(`${modelPath}.json`),
     resolve("models", modelPath),
+    resolve("models", `${modelPath}.onnx`),
     resolve("models", `${modelPath}.json`)
   ];
+  if (modelPath.toLowerCase().endsWith(".onnx")) {
+    candidates.push(resolve("models", "rug_model.json"));
+  }
   for (const candidate of candidates) {
     try {
       await access(candidate);

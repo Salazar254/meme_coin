@@ -65,15 +65,35 @@ Aggregate: 3,589 trades, 62.33% WR, 0.241 trade-weighted Sharpe, 0.41% max DD, p
 ## ML Fine-Tuning
 
 ```bash
-npm run train:ml -- --download false --epochs 650 --block-threshold 0.15
+python -m pip install -r ml/requirements.txt
+npm run train:ml -- --data-dir data/training --epochs 60
 ```
 
-The current `models/rug_model.json` was fine-tuned on 173,697 labeled rows:
+The new production trainer is `ml/train_rug_model.py`. It trains a PyTorch multi-task network and exports `models/rug_model.onnx` with opset 15:
 
-- SolRPDS liquidity/rug behavior rows from 2021-2024
-- Pump Studio Pump.fun risk snapshots from 2026
+- Tabular residual MLP over 14 non-leaky raw risk features
+- 32-d deployer embedding and 24-hour GRU sequence embedding
+- Heads for rug probability, time-to-rug hours, max drawdown, and 2x pump probability
+- Temporal split: train before 2024-10-01, validation through 2024-12-31, test from 2025-01-01 onward
+- 2% label-noise injection, weight decay, dropout, early stopping, 5-fold time-series CV, and permutation importance leakage flags
 
-The trainer records year/source coverage inside `models/rug_model.json`. No labeled 2025 corpus is bundled or cached, so 2025 is intentionally reported as missing rather than silently synthesized.
+The direct `rugcheckScore` feature is intentionally excluded. The model uses raw RugCheck-style signals such as LP unlocked share and danger-signal counts instead. Training writes `models/rug_model_meta.json` with split metrics, feature importance, CV results, and leakage warnings. A realistic validation/test AUC should live around 0.75-0.85; perfect AUC should be treated as a leakage alarm.
+
+## Honest Backtest
+
+```bash
+npm run backtest
+npm run stress
+```
+
+`backtest/engine.ts` replaces the old clairvoyant stress loop. Launch events are decision-time state only; `futureReturnPct` and similar fields are rejected by `assertNoFutureLeakage`. Outcomes come from time-ordered OHLCV bars, constant-product AMM impact, Jito tip-floor simulation, and a real position lifecycle:
+
+- Entry records price, pool depth, tip, and cluster.
+- Holds are evaluated on hourly bars.
+- Exits trigger on dynamic stop, take profit, time-to-rug prediction, or 24-hour max hold.
+- Monte Carlo trade-order shuffles run 100 times per scenario to expose sequence luck.
+
+Paper and live execution are meant to share the same position and exit decision path; only the execution backend should differ.
 
 ## Live Switch
 

@@ -85,6 +85,17 @@ export class ContinualLearner {
         accuracyDelta: 0,
         validationAccuracy: 0.5,
         specialistDeltas: {},
+        regimeState: {
+          currentRegime: 'STABLE',
+          missRate48h: 0,
+          missRatePriorWeek: 0,
+          missRateIncrease: 0,
+          decayingSignals: [],
+          shiftDetected: false,
+          confidenceInDetection: 0,
+          suggestRetrain: false,
+          lastSwitchTimestamp: Date.now(),
+        },
         deployed: false,
       };
     }

@@ -49,8 +49,8 @@ export class RugFilterOrchestrator extends EventEmitter {
   private continualLearner: ContinualLearner;
 
   // State
-  private retrainSchedule: NodeJS.Timer | null = null;
-  private regimeCheckSchedule: NodeJS.Timer | null = null;
+  private retrainSchedule: ReturnType<typeof setInterval> | null = null;
+  private regimeCheckSchedule: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: RugFilterConfig, logger: Logger) {
     super();

@@ -7,11 +7,12 @@
 import pino from 'pino';
 
 import { RugFilterOrchestrator } from './orchestrator/rug-filter-orchestrator';
-import { RugFilterConfig } from './types';
-import { OpportunityRanker } from './components/opportunity-ranker';
-import { DynamicSizer } from './engine/dynamic-sizer';
-import { ExecutionRouter } from './engine/execution-router';
-import { RiskManager } from './engine/risk-manager';
+import { RugFilterConfig, RugFilterDecision } from './types';
+import { TokenSignalExtractor } from './data-layer/token-signal-extractor';
+import { HardRuleEngine } from './components/hard-rule-engine';
+import { RegimeDetector } from './components/regime-detector';
+import { SpecialistEnsemble } from './components/specialist-ensemble';
+import { ConfidenceCalibrator } from './components/confidence-calibrator';
 
 // Export all types and components
 export * from './types';
@@ -123,31 +124,50 @@ if (require.main === module) {
   exampleUsage().catch(console.error);
 }
 
-// Extend the orchestrator to include the high-throughput pipeline
+/**
+ * High-throughput pipeline: wires together extraction → filter → rank → size → execute
+ * Uses actual existing components from the codebase.
+ */
 export class HighThroughputPipeline {
   constructor(
-    private tokenSignals: TokenSignalExtractor,
+    private signalExtractor: TokenSignalExtractor,
     private hardFilter: HardRuleEngine,
-    private opportunityRanker: OpportunityRanker,
+    private ensemble: SpecialistEnsemble,
     private regimeDetector: RegimeDetector,
     private dynamicSizer: DynamicSizer,
     private executionRouter: ExecutionRouter,
     private riskManager: RiskManager,
   ) {}
 
-  async processToken(token: Token): Promise<void> {
-    const signal = await this.tokenSignals.extract(token);
-    const filterResult = await this.hardFilter.evaluate(signal);
+  async processToken(tokenAddress: string, chain: 'solana' | 'ethereum' | 'polygon' = 'solana'): Promise<void> {
+    // 1. Extract signals
+    const signalResult = await this.signalExtractor.extractSignals(tokenAddress, chain);
+    const signals: SignalVector = signalResult.signals;
 
-    if (!filterResult.accepted) {
+    // 2. Hard-rule filter (can short-circuit to reject)
+    const filterResult = this.hardFilter.evaluate(signals);
+    if (filterResult.shouldRejectImmediately) {
       return; // Reject token early
     }
 
-    const rankedOpportunities = await this.opportunityRanker.rank(signal);
-    const regime = await this.regimeDetector.detect(signal);
-    const positionSize = this.dynamicSizer.size(rankedOpportunities, regime);
+    // 3. Ensemble scoring
+    const ensembleResult = await this.ensemble.predict(signals);
 
-    await this.executionRouter.execute(token, positionSize);
-    this.riskManager.track(token, positionSize);
+    // 4. Check regime
+    const regime = await this.regimeDetector.evaluate();
+
+    // 5. Dynamic sizing (uses ensemble score + regime)
+    const positionSize = this.dynamicSizer.computeSize({
+      edgeScore: ensembleResult.ensembleScore,
+      regime: regime.currentRegime,
+      confidence: ensembleResult.confidenceAdjustedScore,
+    });
+
+    // 6. Execute
+    await this.executionRouter.routeExecution({
+      tokenAddress,
+      positionSizeSol: positionSize,
+      signals,
+    });
   }
 }

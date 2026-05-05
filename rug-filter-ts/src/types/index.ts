@@ -191,7 +191,8 @@ export interface RegimeState {
   // Signal decay (information gain drop)
   decayingSignals: Array<{
     signal: string;
-    informatinGainDrop: number; // 0-1
+    informationGainDrop: number; // 0-1
+    isDecaying: boolean;
   }>;
   
   // Regime metadata

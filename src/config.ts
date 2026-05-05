@@ -23,6 +23,9 @@ export interface RiskConfig {
   maxPositionFraction: number;
   kellyFraction: number;
   maxTotalExposureFraction: number;
+  maxClusterExposureFraction: number;
+  correlationClusterPositionThreshold: number;
+  tailRiskVolatilityThreshold: number;
   maxDrawdownCircuitBreakerPct: number;
   dailyDrawdownCircuitBreakerPct: number;
   volatilitySpikeBlock: number;
@@ -146,6 +149,9 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): BotConfig => {
       maxPositionFraction: Math.min(asNumber(env.MAX_POSITION_FRACTION, 0.2), 0.2),
       kellyFraction: asNumber(env.KELLY_FRACTION, 0.2),
       maxTotalExposureFraction: asNumber(env.MAX_TOTAL_EXPOSURE_FRACTION, 0.55),
+      maxClusterExposureFraction: asNumber(env.MAX_CLUSTER_EXPOSURE_FRACTION, 0.25),
+      correlationClusterPositionThreshold: asInt(env.CORRELATION_CLUSTER_POSITION_THRESHOLD, 3),
+      tailRiskVolatilityThreshold: asNumber(env.TAIL_RISK_VOLATILITY_THRESHOLD, 0.75),
       maxDrawdownCircuitBreakerPct: asNumber(env.MAX_DRAWDOWN_CIRCUIT_BREAKER_PCT, 30),
       dailyDrawdownCircuitBreakerPct: asNumber(env.DAILY_DRAWDOWN_CIRCUIT_BREAKER_PCT, 30),
       volatilitySpikeBlock: asNumber(env.VOLATILITY_SPIKE_BLOCK, 0.82),

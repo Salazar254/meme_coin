@@ -141,7 +141,10 @@ export class SniperEngine {
         winProbability: event.predictedWinProb,
         rewardRiskRatio: event.rewardRiskRatio,
         liquiditySol: event.liquiditySol,
-        volatility: event.volatility1m
+        volatility: event.volatility1m,
+        launchPlatform: event.launchPlatform,
+        rugUncertaintyStd: riskResult.uncertainty,
+        memeVolatilityIndex: event.memeVolatilityIndex
       });
 
       if (!plan.accepted) {
@@ -157,7 +160,8 @@ export class SniperEngine {
         mint: event.mint,
         amountSol: plan.amountSol,
         openedAt: Date.now(),
-        riskMode: plan.riskMode
+        riskMode: plan.riskMode,
+        cluster: event.launchPlatform
       });
 
       const receipt = await this.execute(event, wallet, plan.amountSol, plan.stopLossPct, plan.takeProfitPct);
@@ -173,9 +177,6 @@ export class SniperEngine {
 
   async execute(event: TokenLaunchEvent, wallet: WalletRef, amountSol: number, stopLossPct: number, takeProfitPct: number): Promise<TradeReceipt> {
     if (this.config.mode === "paper") {
-      const friction = 0.0005 + event.jitoCompetition * 0.00025;
-      const pnlSol = amountSol * ((event.futureReturnPct || 0) - friction) - this.config.jito.minTipSol;
-      this.risk.recordExit(event.mint, pnlSol);
       this.stats.executed += 1;
       return {
         mint: event.mint,
@@ -183,8 +184,7 @@ export class SniperEngine {
         walletId: wallet.id,
         amountSol,
         accepted: true,
-        reason: "paper_fill",
-        pnlSol
+        reason: "paper_entry_recorded"
       };
     }
 

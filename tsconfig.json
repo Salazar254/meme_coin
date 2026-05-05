@@ -16,6 +16,7 @@
   },
   "include": [
     "src/**/*.ts",
+    "backtest/**/*.ts",
     "scripts/**/*.ts",
     "tests/**/*.ts",
     "run_stress_test.ts"
