@@ -9,6 +9,8 @@ export interface RpcConfig {
   maxRetries: number;
 }
 
+export type SupportedChain = "solana" | "base";
+
 export interface JitoConfig {
   blockEngineUrl: string;
   authUuid?: string;
@@ -22,18 +24,27 @@ export interface RiskConfig {
   startingCapitalSol: number;
   maxPositionFraction: number;
   kellyFraction: number;
+  compoundingReinvestWinPct: number;
+  compoundingMaxBoost: number;
+  compoundingMaxReserveFraction: number;
+  highAlphaKellyBoost: number;
+  maxLiquidityPositionFraction: number;
+  volumeBottleneckLiquidityFraction: number;
   maxTotalExposureFraction: number;
   maxClusterExposureFraction: number;
+  maxPositionPerPlatform: Record<string, number>;
   correlationClusterPositionThreshold: number;
   tailRiskVolatilityThreshold: number;
   maxDrawdownCircuitBreakerPct: number;
   dailyDrawdownCircuitBreakerPct: number;
+  dailyLossLimitSol: number;
   volatilitySpikeBlock: number;
   minTradeSol: number;
   maxOpenPositions: number;
   baseStopLossPct: number;
   baseTakeProfitPct: number;
   consecutiveLossCircuitBreaker: number;
+  maxDeployerPositions: number;
 }
 
 export interface ScorerConfig {
@@ -64,16 +75,44 @@ export interface ThroughputConfig {
   maxQueueDepth: number;
 }
 
+export interface MemeAlphaConfig {
+  enabled: boolean;
+  streamsEnabled: boolean;
+  minScore: number;
+  highConvictionScore: number;
+  sentimentHalfLifeMs: number;
+  sentimentStaleMs: number;
+  socialWsUrls: string[];
+  solanaWsUrl?: string;
+  solanaLogMentions: string[];
+  baseWsUrl?: string;
+  baseLogAddresses: string[];
+  baseLogTopics: string[];
+  liquiditySpikePct: number;
+  minLiquidityDeltaSol: number;
+  volumeSpikeRatio: number;
+  auditBudgetMs: number;
+  blockOnAuditBudgetOverrun: boolean;
+  requireMintAuthorityRenounced: boolean;
+  requireFreezeAuthorityRenounced: boolean;
+  maxTopHolderPct: number;
+  maxTop10HolderPct: number;
+  maxDevHoldPct: number;
+}
+
 export interface BotConfig {
   mode: RuntimeMode;
   liveTrading: boolean;
   logLevel: LogLevel;
+  emergencyHaltPort: number;
+  modelRegistryPath: string;
   rpc: RpcConfig;
   jito: JitoConfig;
   risk: RiskConfig;
   scorer: ScorerConfig;
   wallets: WalletConfig;
   throughput: ThroughputConfig;
+  memeAlpha: MemeAlphaConfig;
 }
 
 const asNumber = (value: string | undefined, fallback: number): number => {
@@ -106,6 +145,18 @@ const splitList = (value: string | undefined): string[] => {
   return value.split(",").map((item) => item.trim()).filter(Boolean);
 };
 
+const asJsonRecord = (value: string | undefined, fallback: Record<string, number>): Record<string, number> => {
+  if (!value || value.trim() === "") {
+    return fallback;
+  }
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    return Object.fromEntries(Object.entries(parsed).map(([key, item]) => [key, asNumber(String(item), fallback[key] ?? 0)]));
+  } catch {
+    return fallback;
+  }
+};
+
 const normalizeMode = (value: string | undefined): RuntimeMode => {
   return value?.toLowerCase() === "live" ? "live" : "paper";
 };
@@ -130,6 +181,8 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): BotConfig => {
     mode,
     liveTrading,
     logLevel: normalizeLogLevel(env.LOG_LEVEL),
+    emergencyHaltPort: asInt(env.EMERGENCY_HALT_PORT, 9090),
+    modelRegistryPath: env.MODEL_REGISTRY_PATH || "./models/registry.json",
     rpc: {
       httpUrls: uniqueRpcUrls,
       wsUrl: env.SOLANA_WS_URL,
@@ -146,20 +199,29 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): BotConfig => {
     },
     risk: {
       startingCapitalSol,
-      maxPositionFraction: Math.min(asNumber(env.MAX_POSITION_FRACTION, 0.2), 0.2),
-      kellyFraction: asNumber(env.KELLY_FRACTION, 0.2),
+      maxPositionFraction: Math.min(asNumber(env.MAX_POSITION_FRACTION, 0.1), 0.1),
+      kellyFraction: asNumber(env.KELLY_FRACTION, 0.15),
+      compoundingReinvestWinPct: Math.min(Math.max(asNumber(env.COMPOUNDING_REINVEST_WIN_PCT, 0.8), 0), 1),
+      compoundingMaxBoost: Math.min(Math.max(asNumber(env.COMPOUNDING_MAX_BOOST, 0.35), 0), 1),
+      compoundingMaxReserveFraction: Math.min(Math.max(asNumber(env.COMPOUNDING_MAX_RESERVE_FRACTION, 0.4), 0), 1),
+      highAlphaKellyBoost: Math.min(Math.max(asNumber(env.HIGH_ALPHA_KELLY_BOOST, 0.25), 0), 1),
+      maxLiquidityPositionFraction: Math.min(Math.max(asNumber(env.MAX_LIQUIDITY_POSITION_FRACTION, 0.015), 0.001), 0.05),
+      volumeBottleneckLiquidityFraction: Math.min(Math.max(asNumber(env.VOLUME_BOTTLENECK_LIQUIDITY_FRACTION, 0.008), 0.001), 0.03),
       maxTotalExposureFraction: asNumber(env.MAX_TOTAL_EXPOSURE_FRACTION, 0.55),
       maxClusterExposureFraction: asNumber(env.MAX_CLUSTER_EXPOSURE_FRACTION, 0.25),
+      maxPositionPerPlatform: asJsonRecord(env.MAX_POSITION_PER_PLATFORM, { pump_fun: 0.3, raydium: 0.4, other: 0.2 }),
       correlationClusterPositionThreshold: asInt(env.CORRELATION_CLUSTER_POSITION_THRESHOLD, 3),
       tailRiskVolatilityThreshold: asNumber(env.TAIL_RISK_VOLATILITY_THRESHOLD, 0.75),
-      maxDrawdownCircuitBreakerPct: asNumber(env.MAX_DRAWDOWN_CIRCUIT_BREAKER_PCT, 30),
-      dailyDrawdownCircuitBreakerPct: asNumber(env.DAILY_DRAWDOWN_CIRCUIT_BREAKER_PCT, 30),
-      volatilitySpikeBlock: asNumber(env.VOLATILITY_SPIKE_BLOCK, 0.82),
+      maxDrawdownCircuitBreakerPct: asNumber(env.MAX_DRAWDOWN_CIRCUIT_BREAKER_PCT, 12),
+      dailyDrawdownCircuitBreakerPct: asNumber(env.DAILY_DRAWDOWN_CIRCUIT_BREAKER_PCT, 8),
+      dailyLossLimitSol: asNumber(env.DAILY_LOSS_LIMIT_SOL, 5),
+      volatilitySpikeBlock: asNumber(env.VOLATILITY_SPIKE_BLOCK, 0.75),
       minTradeSol: asNumber(env.MIN_TRADE_SOL, 0.001),
       maxOpenPositions: asInt(env.MAX_OPEN_POSITIONS, 200),
       baseStopLossPct: asNumber(env.BASE_STOP_LOSS_PCT, 0.12),
       baseTakeProfitPct: asNumber(env.BASE_TAKE_PROFIT_PCT, 0.24),
-      consecutiveLossCircuitBreaker: asInt(env.CONSECUTIVE_LOSS_CIRCUIT_BREAKER, 8)
+      consecutiveLossCircuitBreaker: asInt(env.CONSECUTIVE_LOSS_CIRCUIT_BREAKER, 5),
+      maxDeployerPositions: asInt(env.MAX_DEPLOYER_POSITIONS, 2)
     },
     scorer: {
       modelPath: env.RUG_MODEL_PATH || "./models/rug_model.json",
@@ -185,6 +247,30 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): BotConfig => {
       streamFanout: asInt(env.STREAM_FANOUT, 20),
       eventLoopBatchSize: asInt(env.EVENT_LOOP_BATCH_SIZE, 256),
       maxQueueDepth: asInt(env.MAX_QUEUE_DEPTH, 50000)
+    },
+    memeAlpha: {
+      enabled: asBool(env.MEME_ALPHA_ENABLED, true),
+      streamsEnabled: asBool(env.MEME_ALPHA_STREAMS_ENABLED, false),
+      minScore: asNumber(env.MEME_ALPHA_MIN_SCORE, 0.58),
+      highConvictionScore: asNumber(env.MEME_ALPHA_HIGH_CONVICTION_SCORE, 0.78),
+      sentimentHalfLifeMs: asInt(env.SENTIMENT_HALF_LIFE_MS, 120_000),
+      sentimentStaleMs: asInt(env.SENTIMENT_STALE_MS, 300_000),
+      socialWsUrls: splitList(env.SOCIAL_WS_URLS),
+      solanaWsUrl: env.SOLANA_WS_URL,
+      solanaLogMentions: splitList(env.SOLANA_LOG_MENTIONS),
+      baseWsUrl: env.BASE_WS_URL,
+      baseLogAddresses: splitList(env.BASE_LOG_ADDRESSES),
+      baseLogTopics: splitList(env.BASE_LOG_TOPICS),
+      liquiditySpikePct: asNumber(env.LIQUIDITY_SPIKE_PCT, 0.35),
+      minLiquidityDeltaSol: asNumber(env.MIN_LIQUIDITY_DELTA_SOL, 3),
+      volumeSpikeRatio: asNumber(env.VOLUME_SPIKE_RATIO, 2.2),
+      auditBudgetMs: asNumber(env.ANTI_RUG_AUDIT_BUDGET_MS, 10),
+      blockOnAuditBudgetOverrun: asBool(env.ANTI_RUG_BLOCK_ON_BUDGET_OVERRUN, true),
+      requireMintAuthorityRenounced: asBool(env.REQUIRE_MINT_AUTHORITY_RENOUNCED, true),
+      requireFreezeAuthorityRenounced: asBool(env.REQUIRE_FREEZE_AUTHORITY_RENOUNCED, true),
+      maxTopHolderPct: asNumber(env.MAX_TOP_HOLDER_PCT, 0.22),
+      maxTop10HolderPct: asNumber(env.MAX_TOP10_HOLDER_PCT, 0.55),
+      maxDevHoldPct: asNumber(env.MAX_DEV_HOLD_PCT, 0.08)
     }
   };
 };

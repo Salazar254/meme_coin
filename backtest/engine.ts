@@ -23,7 +23,12 @@ interface OpenPosition {
   timeToRugHours: number;
   cluster: string;
   entryTipSol: number;
+  retryFeeSol: number;
 }
+
+const ATA_RENT_SOL = 0.002039;
+const FAILED_TX_FEE_SOL = 0.000005;
+const RECLAIM_ATA_RENT_ON_EXIT = true;
 
 export class HonestBacktestEngine {
   config: BotConfig;
@@ -91,6 +96,7 @@ export class HonestBacktestEngine {
       rewardRiskRatio: event.rewardRiskRatio,
       liquiditySol: event.liquiditySol,
       volatility: event.volatility1m,
+      deployer: event.deployer,
       launchPlatform: event.launchPlatform,
       rugUncertaintyStd: score.uncertainty,
       memeVolatilityIndex: event.volatility1m
@@ -117,19 +123,43 @@ export class HonestBacktestEngine {
       return;
     }
 
-    const tipSol = this.tipFor(event.timestamp, event.jitoCompetition, tips);
+    const amountSol = impact.inputAmount;
+    let tipSol = this.tipFor(event.timestamp, event.jitoCompetition, tips);
+    let retryFeeSol = 0;
     if (!this.bundleLands(tipSol, event.jitoCompetition, tips, event.timestamp)) {
-      this.reject("jito_bundle_not_landed");
+      retryFeeSol += FAILED_TX_FEE_SOL;
+      const retryTip = Math.min(this.config.jito.maxTipSol, tipSol * 1.5);
+      if (!this.bundleLands(retryTip, Math.max(0, event.jitoCompetition - 0.08), tips, event.timestamp + 800)) {
+        this.trades.push({
+          mint: event.mint,
+          openedAt: event.timestamp,
+          closedAt: event.timestamp + 800,
+          amountSol: 0,
+          pnlSol: -retryFeeSol,
+          returnPct: 0,
+          exitReason: "failed_entry_bundle",
+          cluster: String(event.launchPlatform || "unknown")
+        });
+        this.risk.realizedPnlSol -= retryFeeSol;
+        this.reject("jito_bundle_not_landed");
+        return;
+      }
+      tipSol = retryTip;
+      retryFeeSol += FAILED_TX_FEE_SOL;
+    }
+    if (amountSol > event.liquiditySol * 0.02 && impact.chunks.length < 2) {
+      this.reject("order_too_large_for_pool_depth");
       return;
     }
 
-    const amountSol = impact.inputAmount;
     this.risk.recordEntry({
       mint: event.mint,
       amountSol,
       openedAt: event.timestamp,
       riskMode: plan.riskMode,
-      cluster: String(event.launchPlatform || "unknown")
+      cluster: String(event.launchPlatform || "unknown"),
+      platform: String(event.launchPlatform || "unknown"),
+      deployer: event.deployer
     });
     this.openPositions.set(event.mint, {
       mint: event.mint,
@@ -141,7 +171,8 @@ export class HonestBacktestEngine {
       takeProfitPct: plan.takeProfitPct,
       timeToRugHours: score.timeToRugHours ?? 24,
       cluster: String(event.launchPlatform || "unknown"),
-      entryTipSol: tipSol
+      entryTipSol: tipSol,
+      retryFeeSol
     });
   }
 
@@ -182,7 +213,8 @@ export class HonestBacktestEngine {
     });
     const grossExitSol = impact.outputAmount > 0 ? impact.outputAmount : position.tokenAmount * bar.close * 0.997;
     const exitTipSol = this.tipFor(bar.timestamp, 0.5, tips);
-    const pnlSol = grossExitSol - position.amountSol - position.entryTipSol - exitTipSol;
+    const rentReclaimSol = RECLAIM_ATA_RENT_ON_EXIT ? ATA_RENT_SOL : 0;
+    const pnlSol = grossExitSol - position.amountSol - position.entryTipSol - exitTipSol - ATA_RENT_SOL + rentReclaimSol - position.retryFeeSol;
     this.openPositions.delete(position.mint);
     this.risk.recordExit(position.mint, pnlSol);
     this.trades.push({

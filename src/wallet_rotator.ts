@@ -15,7 +15,7 @@ export class WalletRotator {
   logger: Logger;
   wallets: WalletRef[];
   cursor = 0;
-  redisPublisher: { publish(channel: string, message: string): Promise<number> } | undefined;
+  redisPublisher: { publish(channel: string, message: string): Promise<number>; quit?(): Promise<string> } | undefined;
 
   constructor(config: WalletConfig, logger: Logger) {
     this.config = config;
@@ -29,8 +29,7 @@ export class WalletRotator {
     }
     try {
       const module = await import("ioredis");
-      type RedisLike = { publish(channel: string, message: string): Promise<number>; quit?: () => Promise<string> };
-      type RedisConstructor = new (url: string) => RedisLike;
+      type RedisConstructor = new (url: string) => NonNullable<WalletRotator["redisPublisher"]>;
       const RedisCtor = (module.default as unknown) as RedisConstructor;
       this.redisPublisher = new RedisCtor(this.config.redisUrl);
       this.logger.info({ redisUrl: this.config.redisUrl }, "wallet_pubsub_connected");
@@ -41,9 +40,8 @@ export class WalletRotator {
   }
 
   async stop(): Promise<void> {
-    const publisher = this.redisPublisher as unknown as { quit?: () => Promise<string> } | undefined;
-    if (publisher?.quit) {
-      await publisher.quit();
+    if (this.redisPublisher?.quit) {
+      await this.redisPublisher.quit();
     }
   }
 

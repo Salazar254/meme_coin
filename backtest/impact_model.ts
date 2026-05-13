@@ -18,6 +18,7 @@ export interface SwapImpactResult {
   priceImpactPct: number;
   partialFill: boolean;
   reason: string;
+  chunks: number[];
 }
 
 const clamp = (value: number, low: number, high: number): number => Math.max(low, Math.min(high, value));
@@ -51,7 +52,8 @@ export const simulateAmmSwap = (request: SwapImpactRequest): SwapImpactResult =>
       slippagePct,
       priceImpactPct: Math.max(priceImpactPct, unitSlippagePct),
       partialFill: false,
-      reason: slippagePct <= maxSlippagePct ? "accepted" : "slippage_exceeds_limit"
+      reason: slippagePct <= maxSlippagePct ? "accepted" : "slippage_exceeds_limit",
+      chunks: [inputAmount]
     };
   };
 
@@ -80,6 +82,7 @@ export const simulateAmmSwap = (request: SwapImpactRequest): SwapImpactResult =>
   return {
     ...best,
     partialFill: best.inputAmount < request.inputAmount * 0.999,
+    chunks: splitLargeOrder(best.inputAmount, request.inputReserve),
     reason: "partial_fill"
   };
 };
@@ -92,4 +95,28 @@ export const poolFromPriceAndLiquidity = (priceSol: number, liquiditySol: number
     outputReserve,
     feeBps: 30
   };
+};
+
+export const splitLargeOrder = (inputAmount: number, poolDepthSol: number): number[] => {
+  if (inputAmount <= poolDepthSol * 0.02) {
+    return [inputAmount];
+  }
+  const chunks = inputAmount / poolDepthSol > 0.04 ? 3 : 2;
+  return Array.from({ length: chunks }, () => inputAmount / chunks);
+};
+
+export const pumpFunBondingCurveOutput = (solInput: number, supply: number, feeBps = 100): {
+  tokenOutput: number;
+  priceAfter: number;
+  slippagePct: number;
+} => {
+  const virtualSol = 30;
+  const virtualTokens = 1_073_000_000;
+  const effectiveInput = solInput * (1 - feeBps / 10_000);
+  const tokenReserve = Math.max(1, virtualTokens - Math.max(0, supply));
+  const output = tokenReserve - (virtualSol * tokenReserve) / (virtualSol + effectiveInput);
+  const spotOutput = effectiveInput * (tokenReserve / virtualSol);
+  const priceAfter = (virtualSol + effectiveInput) / Math.max(1, tokenReserve - output);
+  const slippagePct = output > 0 ? Math.max(0, (spotOutput / output - 1) * 100) : 100;
+  return { tokenOutput: output, priceAfter, slippagePct };
 };

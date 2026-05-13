@@ -1,30 +1,17 @@
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { DeployerLookup } from "../features/deployer_lookup.ts";
-import { SEQUENCE_LENGTH, type ModelSequence } from "../features/sequence_buffer.ts";
+import { TABULAR_FEATURES } from "../features/feature_schema.ts";
+import { SEQUENCE_LENGTH, TEMPORAL_EMBEDDING_DIM, type ModelSequence } from "../features/sequence_buffer.ts";
 import { clamp, summarizeMultiTask, type MultiTaskUncertainty } from "./uncertainty.ts";
 
-export const ONNX_FEATURE_ORDER = [
-  "rugPullRisk",
-  "honeypotRisk",
-  "lpBurnGap",
-  "transferTaxPct",
-  "topHolderPct",
-  "devHoldPct",
-  "mutableMetadata",
-  "mintAuthority",
-  "freezeAuthority",
-  "volatility1m",
-  "lowLiquidity",
-  "lowBuyers",
-  "rugcheckLpUnlocked",
-  "rugcheckDangerSignals"
-] as const;
+export const ONNX_FEATURE_ORDER = TABULAR_FEATURES;
 
 export interface OnnxScoreInput {
   features: Record<string, number>;
   deployerId?: number;
   sequence?: ModelSequence;
+  temporalEmbedding?: Float32Array | number[];
 }
 
 export interface OnnxScoreResult {
@@ -33,6 +20,7 @@ export interface OnnxScoreResult {
   maxDrawdown: number;
   pump2xProb: number;
   uncertainty: number;
+  highUncertainty: boolean;
   distributions: MultiTaskUncertainty;
   elapsedMs: number;
 }
@@ -90,7 +78,7 @@ export class OnnxRugScorer {
     const session = await sessionPromise;
     const metadataPath = options.metadataPath || resolved.replace(/\.onnx$/i, "_meta.json");
     const featureOrder = await loadFeatureOrder(metadataPath);
-    return new OnnxRugScorer(resolved, session, ort, featureOrder, options.mcPasses ?? 20, options.deployerLookup);
+    return new OnnxRugScorer(resolved, session, ort, featureOrder, options.mcPasses ?? 15, options.deployerLookup);
   }
 
   async score(input: OnnxScoreInput, passes = this.mcPasses): Promise<OnnxScoreResult> {
@@ -102,7 +90,7 @@ export class OnnxRugScorer {
       samples.push({
         rugProb: clamp(readScalar(outputs.rug_prob)),
         timeToRug: Math.max(0, readScalar(outputs.time_to_rug_hours)),
-        maxDrawdown: clamp(readScalar(outputs.max_drawdown_pct), 0, 100),
+        maxDrawdown: clamp(readScalar(outputs.max_drawdown_pct), 0, 1),
         pump2xProb: clamp(readScalar(outputs.pump_2x_prob))
       });
     }
@@ -113,6 +101,7 @@ export class OnnxRugScorer {
       maxDrawdown: distributions.maxDrawdown.mean,
       pump2xProb: distributions.pump2xProb.mean,
       uncertainty: distributions.rugProb.std,
+      highUncertainty: Object.values(distributions).some((summary) => summary.std > 0.08),
       distributions,
       elapsedMs: performance.now() - started
     };
@@ -124,29 +113,49 @@ export class OnnxRugScorer {
 
   feeds(input: OnnxScoreInput): Record<string, import("onnxruntime-node").Tensor> {
     const featureValues = this.featureOrder.map((name) => Number.isFinite(input.features[name]) ? input.features[name] : 0);
-    const sequence = normalizeSequence(input.sequence);
     const deployerId = BigInt(Math.max(0, input.deployerId ?? 0));
-    return {
+    const baseFeeds: Record<string, import("onnxruntime-node").Tensor> = {
       tabular: new this.ort.Tensor("float32", Float32Array.from(featureValues), [1, this.featureOrder.length]),
-      deployer_id: new this.ort.Tensor("int64", BigInt64Array.from([deployerId]), [1]),
-      sequence: new this.ort.Tensor("float32", Float32Array.from(sequence.flat()), [1, SEQUENCE_LENGTH, 5])
+      deployer_id: new this.ort.Tensor("int64", BigInt64Array.from([deployerId]), [1])
     };
+    if (this.inputNames().includes("temporal_embedding")) {
+      baseFeeds.temporal_embedding = new this.ort.Tensor("float32", normalizeTemporalEmbedding(input.temporalEmbedding), [1, TEMPORAL_EMBEDDING_DIM]);
+      return baseFeeds;
+    }
+    const sequenceWidth = this.sequenceWidth();
+    const sequence = normalizeLegacySequence(input.sequence, sequenceWidth);
+    baseFeeds.sequence = new this.ort.Tensor("float32", Float32Array.from(sequence.flat()), [1, SEQUENCE_LENGTH, sequenceWidth]);
+    return baseFeeds;
+  }
+
+  inputNames(): string[] {
+    return (this.session as unknown as { inputNames?: string[] }).inputNames || [];
+  }
+
+  sequenceWidth(): number {
+    const metadata = (this.session as unknown as { inputMetadata?: Record<string, { dimensions?: Array<number | string> }> }).inputMetadata;
+    const width = metadata?.sequence?.dimensions?.[2];
+    return typeof width === "number" && width > 0 ? width : 5;
   }
 }
 
-const normalizeSequence = (sequence?: ModelSequence): ModelSequence => {
-  const empty = [0, 0, 0, 1, 0];
+const normalizeLegacySequence = (sequence?: ModelSequence, width = 5): ModelSequence => {
+  const empty = Array.from({ length: width }, (_, index) => index === 3 ? 1 : 0);
   const rows = (sequence || []).slice(-SEQUENCE_LENGTH).map((row) => [
-    finite(row[0], 0),
-    finite(row[1], 0),
-    finite(row[2], 0),
-    finite(row[3], 1),
-    finite(row[4], 0)
+    ...Array.from({ length: width }, (_, index) => finite(row[index], index === 3 ? 1 : 0))
   ]);
   while (rows.length < SEQUENCE_LENGTH) {
     rows.unshift([...empty]);
   }
   return rows;
+};
+
+const normalizeTemporalEmbedding = (embedding?: Float32Array | number[]): Float32Array => {
+  const values = Array.from(embedding || []);
+  while (values.length < TEMPORAL_EMBEDDING_DIM) {
+    values.push(0);
+  }
+  return Float32Array.from(values.slice(0, TEMPORAL_EMBEDDING_DIM).map((value) => finite(value, 0)));
 };
 
 const finite = (value: number | undefined, fallback: number): number => Number.isFinite(value) ? Number(value) : fallback;

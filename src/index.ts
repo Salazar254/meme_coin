@@ -2,6 +2,7 @@ import { loadConfig } from "./config.ts";
 import { createLogger } from "./utils/logger.ts";
 import { TokenRiskScorer, type TokenLaunchEvent } from "./token_risk_scorer.ts";
 import { SniperEngine } from "./sniper_engine.ts";
+import { MemeAlphaStreamHub } from "./meme_alpha/streams.ts";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -10,10 +11,12 @@ const sampleEvent = (): TokenLaunchEvent => ({
   deployer: "paper_deployer",
   timestamp: Date.now(),
   liquiditySol: 12,
+  previousLiquiditySol: 6,
   lpBurnPct: 0.98,
   ageSeconds: 2.2,
   uniqueBuyers: 28,
   totalVolumeSol: 18,
+  previousVolumeSol: 4.8,
   marketCapSol: 180,
   rugPullRisk: 0.025,
   honeypotRisk: 0.01,
@@ -30,7 +33,6 @@ const sampleEvent = (): TokenLaunchEvent => ({
   launchRatePerMinute: 420,
   predictedWinProb: 0.58,
   rewardRiskRatio: 1.45,
-  futureReturnPct: 0.012,
   synthetic: true
 });
 
@@ -53,16 +55,37 @@ export const main = async (): Promise<void> => {
   await engine.start();
 
   if (config.mode === "paper") {
+    engine.ingestSocialPost({
+      source: "x",
+      mint: sampleEvent().mint,
+      timestamp: Date.now(),
+      author: "paper_signal",
+      authorFollowers: 42_000,
+      authorVerified: true,
+      text: "Smart money accumulating, fresh wallet cluster swept the floor while LP added."
+    });
     engine.submit(sampleEvent());
     await engine.drain();
     await engine.stop();
     return;
   }
 
+  let streamHub: MemeAlphaStreamHub | undefined;
+  if (config.memeAlpha.enabled && config.memeAlpha.streamsEnabled) {
+    streamHub = new MemeAlphaStreamHub(config.memeAlpha, logger, {
+      onLaunch: (event) => {
+        engine.submit(event);
+      },
+      onSocial: (post) => engine.ingestSocialPost(post)
+    });
+    streamHub.start();
+  }
+
   logger.info({
     mode: config.mode,
     streams: config.throughput.streamFanout,
-    targetEventsPerHour: config.throughput.targetEventsPerHour
+    targetEventsPerHour: config.throughput.targetEventsPerHour,
+    memeAlphaStreams: Boolean(streamHub)
   }, "live_engine_ready_for_stream_adapter");
 };
 

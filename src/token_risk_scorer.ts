@@ -1,29 +1,43 @@
 import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { MarketRegime, ScorerConfig } from "./config.ts";
+import type { MarketRegime, ScorerConfig, SupportedChain } from "./config.ts";
 import type { Logger } from "./utils/logger.ts";
 import { DeployerLookup } from "./features/deployer_lookup.ts";
 import { SequenceBuffer } from "./features/sequence_buffer.ts";
+import { computeTabularFeatures } from "./features/feature_schema.ts";
 import { OnnxRugScorer } from "./ml/onnx_scorer.ts";
 
 export interface TokenLaunchEvent {
   mint: string;
   deployer: string;
   timestamp: number;
+  chain?: SupportedChain;
+  contractAddress?: string;
+  poolAddress?: string;
+  txSignature?: string;
   liquiditySol: number;
+  previousLiquiditySol?: number;
+  liquiditySpikePct?: number;
   lpBurnPct: number;
   ageSeconds: number;
   uniqueBuyers: number;
   totalVolumeSol: number;
+  previousVolumeSol?: number;
+  volumeSpikeRatio?: number;
   marketCapSol: number;
   rugPullRisk: number;
   honeypotRisk: number;
   transferTaxPct: number;
   topHolderPct: number;
+  top10HolderPct?: number;
   devHoldPct: number;
   mutableMetadata: boolean;
   mintAuthorityRenounced: boolean;
   freezeAuthorityRenounced: boolean;
+  ownerRenounced?: boolean;
+  proxyContract?: boolean;
+  blacklistFunction?: boolean;
+  tradingPaused?: boolean;
   volatility1m: number;
   priceVelocity1m: number;
   buySellRatio: number;
@@ -33,7 +47,12 @@ export interface TokenLaunchEvent {
   rewardRiskRatio: number;
   launchPlatform?: string;
   memeVolatilityIndex?: number;
-  futureReturnPct?: number;
+  memeAlphaScore?: number;
+  sentimentScore?: number;
+  whaleAccumulationScore?: number;
+  retailFomoScore?: number;
+  botSpamScore?: number;
+  volumeBottleneckRatio?: number;
   synthetic?: boolean;
 }
 
@@ -165,9 +184,6 @@ export class TokenRiskScorer {
 
     const prediction = await this.predictFull(event, rugcheck);
     const riskProbability = prediction.riskProbability;
-    if (prediction.uncertainty > 0.1) {
-      reasons.push("model_uncertainty_review");
-    }
     if (riskProbability > this.config.rugProbBlockThreshold && prediction.uncertainty < 0.05) {
       reasons.push("ml_risk_probability");
     }
@@ -199,7 +215,8 @@ export class TokenRiskScorer {
       const scored = await this.onnxScorer.score({
         features,
         deployerId: this.deployerLookup?.idFor(event.deployer),
-        sequence: this.sequenceBuffer.sequenceFor(event.mint, event.timestamp)
+        sequence: this.sequenceBuffer.sequenceFor(event.mint, event.timestamp),
+        temporalEmbedding: await this.sequenceBuffer.embeddingFor(event.mint, event.timestamp)
       });
       return {
         riskProbability: clamp(scored.rugProb),
@@ -223,24 +240,7 @@ export class TokenRiskScorer {
   }
 
   features(event: TokenLaunchEvent, rugcheck?: RugCheckSummary): Record<string, number> {
-    const dangerSignals = rugcheck?.risks?.filter((risk) => ["danger", "critical"].includes(String(risk.level || "").toLowerCase())).length || 0;
-    return {
-      rugPullRisk: clamp(event.rugPullRisk),
-      honeypotRisk: clamp(event.honeypotRisk),
-      lpBurnGap: clamp(1 - event.lpBurnPct),
-      transferTaxPct: clamp(event.transferTaxPct),
-      topHolderPct: clamp(event.topHolderPct),
-      devHoldPct: clamp(event.devHoldPct),
-      mutableMetadata: event.mutableMetadata ? 1 : 0,
-      mintAuthority: event.mintAuthorityRenounced ? 0 : 1,
-      freezeAuthority: event.freezeAuthorityRenounced ? 0 : 1,
-      volatility1m: clamp(event.volatility1m),
-      lowLiquidity: clamp(1 / Math.max(event.liquiditySol, 0.05) / 5),
-      lowBuyers: clamp(1 - event.uniqueBuyers / 40),
-      rugcheckLpUnlocked: rugcheck ? clamp(1 - (rugcheck.lpLockedPct ?? (rugcheck.lpLocked ? 100 : 0)) / 100) : 0,
-      rugcheckDangerSignals: clamp(dangerSignals / 4),
-      rugcheckTopHolders: clamp((rugcheck?.topHoldersPct || event.topHolderPct * 100) / 100)
-    };
+    return computeTabularFeatures({ event, rugcheck });
   }
 
   detectRegime(event: TokenLaunchEvent, riskProbability: number): MarketRegime {
@@ -298,9 +298,7 @@ const resolveModelPath = async (modelPath: string): Promise<string> => {
     try {
       await access(candidate);
       return candidate;
-    } catch {
-      continue;
-    }
+    } catch {}
   }
   return candidates[0];
 };

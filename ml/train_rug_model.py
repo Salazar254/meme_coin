@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import os
@@ -96,7 +97,7 @@ class RugRiskNet(nn.Module):
         self.register_buffer("feature_mean", torch.tensor(feature_mean if feature_mean is not None else np.zeros(tabular_dim), dtype=torch.float32))
         self.register_buffer("feature_std", torch.tensor(feature_std if feature_std is not None else np.ones(tabular_dim), dtype=torch.float32))
         self.deployer_embedding = nn.Embedding(num_deployers, deployer_dim)
-        self.sequence_encoder = SequenceEncoder(input_dim=5, hidden_dim=sequence_dim)
+        self.sequence_encoder = SequenceEncoder(input_dim=6, hidden_dim=sequence_dim, num_layers=2)
 
         self.input_skip = nn.Linear(input_dim, 128)
         self.block1 = nn.Sequential(
@@ -135,8 +136,8 @@ class RugRiskNet(nn.Module):
         h2 = self.block2(h1) + self.skip2(h1)
         z = self.block3(h2)
         rug_prob = torch.sigmoid(self.rug_head(z))
-        time_to_rug = F.softplus(self.time_head(z))
-        max_drawdown = torch.sigmoid(self.drawdown_head(z)) * 100.0
+        time_to_rug = torch.clamp(F.relu(self.time_head(z)), max=72.0)
+        max_drawdown = torch.sigmoid(self.drawdown_head(z))
         pump_2x_prob = torch.sigmoid(self.pump_head(z))
         return rug_prob, time_to_rug, max_drawdown, pump_2x_prob
 
@@ -176,7 +177,8 @@ def default_sequence(features: dict[str, float]) -> list[list[float]]:
     volume = max(0.0, features["volatility1m"] * liquidity * 2.0)
     ratio = max(0.05, 1.0 - features["honeypotRisk"] + features["rugPullRisk"])
     velocity = features["volatility1m"] * (1.0 - features["rugPullRisk"])
-    return [[holders, liquidity, volume, ratio, velocity] for _ in range(SEQUENCE_LENGTH)]
+    tx_count = max(1.0, holders * max(ratio, 0.05))
+    return [[holders, liquidity, volume, ratio, velocity, tx_count] for _ in range(SEQUENCE_LENGTH)]
 
 
 def load_generic_jsonl(path: str) -> list[Example]:
@@ -363,8 +365,8 @@ def build_tensors(examples: list[Example], deployer_to_id: dict[str, int]) -> tu
     deployer = torch.tensor([deployer_to_id.get(item.deployer, 0) for item in examples], dtype=torch.long)
     seq = torch.tensor([pad_sequence(item.sequence) for item in examples], dtype=torch.float32)
     y_rug = torch.tensor([[item.rug_label] for item in examples], dtype=torch.float32)
-    y_time = torch.tensor([[min(item.time_to_rug_hours, 24.0)] for item in examples], dtype=torch.float32)
-    y_dd = torch.tensor([[clamp(item.max_drawdown_pct / 100.0) * 100.0] for item in examples], dtype=torch.float32)
+    y_time = torch.tensor([[min(item.time_to_rug_hours, 72.0)] for item in examples], dtype=torch.float32)
+    y_dd = torch.tensor([[clamp(item.max_drawdown_pct / 100.0)] for item in examples], dtype=torch.float32)
     y_pump = torch.tensor([[item.pump_2x_label] for item in examples], dtype=torch.float32)
     weights = torch.tensor([[item.weight] for item in examples], dtype=torch.float32)
     return x, deployer, seq, y_rug, y_time, y_dd, y_pump, weights
@@ -373,8 +375,8 @@ def build_tensors(examples: list[Example], deployer_to_id: dict[str, int]) -> tu
 def pad_sequence(sequence: list[list[float]]) -> list[list[float]]:
     clipped = sequence[-SEQUENCE_LENGTH:]
     if len(clipped) < SEQUENCE_LENGTH:
-        clipped = [[0.0, 0.0, 0.0, 1.0, 0.0] for _ in range(SEQUENCE_LENGTH - len(clipped))] + clipped
-    return [[safe_float(value) for value in row[:5]] + [0.0] * max(0, 5 - len(row)) for row in clipped]
+        clipped = [[0.0, 0.0, 0.0, 1.0, 0.0, 0.0] for _ in range(SEQUENCE_LENGTH - len(clipped))] + clipped
+    return [[safe_float(value) for value in row[:6]] + [0.0] * max(0, 6 - len(row)) for row in clipped]
 
 
 def inject_label_noise(examples: list[Example], rate: float, seed: int) -> list[Example]:
@@ -401,8 +403,8 @@ def multitask_loss(outputs: tuple[torch.Tensor, ...], targets: tuple[torch.Tenso
     y_rug, y_time, y_dd, y_pump = targets
     bce_rug = F.binary_cross_entropy(rug, y_rug, reduction="none")
     bce_pump = F.binary_cross_entropy(pump, y_pump, reduction="none")
-    time_loss = F.smooth_l1_loss(time_to_rug, y_time, reduction="none") / 24.0
-    dd_loss = F.smooth_l1_loss(drawdown, y_dd, reduction="none") / 100.0
+    time_loss = F.smooth_l1_loss(time_to_rug, y_time, reduction="none") / 72.0
+    dd_loss = F.smooth_l1_loss(drawdown, y_dd, reduction="none")
     total = 1.8 * bce_rug + 0.35 * time_loss + 0.35 * dd_loss + 0.6 * bce_pump
     return torch.mean(total * weights)
 
@@ -493,7 +495,7 @@ def train_model(
 
     train_tensors = build_tensors(train_noisy, deployer_to_id)
     val_tensors = build_tensors(val, deployer_to_id)
-    loader = DataLoader(TensorDataset(*train_tensors), batch_size=batch_size, shuffle=True)
+    loader = DataLoader(TensorDataset(*train_tensors), batch_size=batch_size, shuffle=False)
     best_state: dict[str, torch.Tensor] | None = None
     best_val_loss = float("inf")
     patience = 0
@@ -519,7 +521,7 @@ def train_model(
             patience = 0
         else:
             patience += 1
-            if patience >= 10:
+            if patience >= 20:
                 break
 
     if best_state:
@@ -566,7 +568,7 @@ def permutation_importance(model: RugRiskNet, examples: list[Example], deployer_
         raw_scores[name] = max(0.0, evaluate_loss(model, build_tensors(permuted, deployer_to_id)) - base_loss)
     total = sum(raw_scores.values()) or 1.0
     normalized = {name: score / total for name, score in raw_scores.items()}
-    flags = [name for name, score in normalized.items() if score > 0.4]
+    flags = [name for name, score in normalized.items() if score > 0.35]
     return {"features": normalized, "base_loss": base_loss, "leakage_flags": flags}
 
 
@@ -615,7 +617,7 @@ def export_onnx(model: RugRiskNet, output_path: str) -> None:
     set_force_dropout(model, True)
     tabular = torch.zeros(1, len(FEATURE_NAMES), dtype=torch.float32)
     deployer = torch.zeros(1, dtype=torch.long)
-    sequence = torch.zeros(1, SEQUENCE_LENGTH, 5, dtype=torch.float32)
+    sequence = torch.zeros(1, SEQUENCE_LENGTH, 6, dtype=torch.float32)
     try:
         torch.onnx.export(
             model,
@@ -678,6 +680,9 @@ def save_outputs(
     export_onnx(model, output_path)
     metadata = {
         "version": 1,
+        "training_date": datetime.now(timezone.utc).isoformat(),
+        "val_auc": metrics["validation"]["auc"],
+        "feature_schema_hash": hashlib.sha256(json.dumps(FEATURE_NAMES, separators=(",", ":")).encode("utf-8")).hexdigest(),
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "architecture": "tabular_residual_mlp_sequence_gru_deployer_embedding_multitask",
         "onnx_opset": 15,

@@ -17,10 +17,52 @@ export class RpcPool {
   logger: Logger;
   cursor = 0;
   failures = new Map<string, number>();
+  unhealthy = new Set<string>();
+  latencyMs = new Map<string, number>();
+  healthTimer?: NodeJS.Timeout;
 
   constructor(config: RpcConfig, logger: Logger) {
     this.config = config;
     this.logger = logger.child({ component: "rpc_pool" });
+  }
+
+  startHealthChecks(intervalMs = 30_000): void {
+    this.healthTimer = setInterval(() => {
+      void this.healthCheckOnce();
+    }, intervalMs);
+    void this.healthCheckOnce();
+  }
+
+  stopHealthChecks(): void {
+    if (this.healthTimer) {
+      clearInterval(this.healthTimer);
+      this.healthTimer = undefined;
+    }
+  }
+
+  async healthCheckOnce(): Promise<void> {
+    await Promise.all(this.config.httpUrls.map(async (url) => {
+      const started = performance.now();
+      try {
+        await this.post<RpcResponse<string>>(url, {
+          jsonrpc: "2.0",
+          id: Date.now(),
+          method: "getHealth",
+          params: []
+        });
+        this.failures.set(url, 0);
+        this.unhealthy.delete(url);
+        this.latencyMs.set(url, performance.now() - started);
+      } catch (error) {
+        const failures = (this.failures.get(url) || 0) + 1;
+        this.failures.set(url, failures);
+        if (failures >= 2) {
+          this.unhealthy.add(url);
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        this.logger.warn({ url, failures, error: message }, "rpc_health_check_failed");
+      }
+    }));
   }
 
   async call<T>(method: string, params: unknown[] = []): Promise<T> {
@@ -41,10 +83,15 @@ export class RpcPool {
           throw new Error("missing_rpc_result");
         }
         this.failures.set(url, 0);
+        this.unhealthy.delete(url);
         return response.result;
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
-        this.failures.set(url, (this.failures.get(url) || 0) + 1);
+        const failures = (this.failures.get(url) || 0) + 1;
+        this.failures.set(url, failures);
+        if (failures >= 2) {
+          this.unhealthy.add(url);
+        }
         this.logger.warn({ method, url, attempt, error: lastError.message }, "rpc_call_failed");
       }
     }
@@ -56,9 +103,13 @@ export class RpcPool {
     if (urls.length === 0) {
       throw new Error("no_rpc_urls_configured");
     }
-    const index = this.cursor % urls.length;
+    const healthy = urls.filter((url) => !this.unhealthy.has(url));
+    const candidates = healthy.length > 0 ? healthy : urls;
+    const fastest = [...candidates].sort((a, b) => (this.latencyMs.get(a) ?? Number.POSITIVE_INFINITY) - (this.latencyMs.get(b) ?? Number.POSITIVE_INFINITY));
+    const rotation = fastest.some((url) => Number.isFinite(this.latencyMs.get(url) ?? Number.POSITIVE_INFINITY)) ? fastest : candidates;
+    const index = this.cursor % rotation.length;
     this.cursor += 1;
-    return urls[index];
+    return rotation[index];
   }
 
   async post<T>(url: string, body: unknown): Promise<T> {

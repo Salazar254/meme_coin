@@ -134,7 +134,28 @@ Position sizing uses fractional Kelly:
 size = Kelly * 0.2 * regime_factor * ML_confidence
 ```
 
-Trade size is capped at 20% of equity, with total exposure, volatility, consecutive-loss, daily drawdown, and max drawdown circuit breakers. Max drawdown breaker defaults to 30%.
+Trade size is capped at 10% of equity by default, with total exposure, volatility, consecutive-loss, daily drawdown, and max drawdown circuit breakers. Max drawdown breaker defaults to 12%.
+
+## Meme-Alpha Agent
+
+The TypeScript path now includes a local `MemeAlphaAgent` in front of the existing scorer:
+
+- `LiquiditySpikeDetector` verifies fresh liquidity and volume spikes before a token can enter the queue.
+- `DegenspeakSentimentEngine` keeps a half-life weighted book of X/Telegram-style posts and separates whale accumulation language from retail FOMO and spam.
+- `AntiRugGuard` runs a budgeted local audit for mint authority, freeze authority, EVM owner/proxy risks, and holder concentration.
+- `RiskManager` tracks a compounding reserve. By default 80% of winning PnL is reserved for future high-alpha, verified volume-bottleneck setups, while still respecting the global Kelly, exposure, liquidity, and drawdown caps.
+
+Real-time streams are optional and off by default:
+
+```env
+MEME_ALPHA_ENABLED=true
+MEME_ALPHA_STREAMS_ENABLED=true
+SOCIAL_WS_URLS=wss://your-normalized-social-feed
+SOLANA_WS_URL=wss://your-solana-rpc
+BASE_WS_URL=wss://your-base-rpc
+```
+
+The stream hub accepts normalized JSON launch events directly. Raw Solana/Base subscriptions are opened for low-latency fan-in, but DEX-specific decoding should be done by a trusted feeder that emits the decision-time fields shown in `TokenLaunchEvent`.
 
 ## Deploy
 

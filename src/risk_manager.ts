@@ -11,8 +11,14 @@ export interface RiskSignal {
   rewardRiskRatio: number;
   liquiditySol: number;
   volatility: number;
+  deployer?: string;
   launchPlatform?: string;
+  sector?: string;
   memeVolatilityIndex?: number;
+  memeAlphaScore?: number;
+  whaleAccumulationScore?: number;
+  retailFomoScore?: number;
+  volumeBottleneckRatio?: number;
 }
 
 export interface PositionPlan {
@@ -31,6 +37,9 @@ export interface PositionRecord {
   openedAt: number;
   riskMode: MarketRegime;
   cluster?: string;
+  platform?: string;
+  sector?: string;
+  deployer?: string;
 }
 
 export interface RiskSnapshot {
@@ -41,8 +50,10 @@ export interface RiskSnapshot {
   maxDrawdownPct: number;
   dailyDrawdownPct: number;
   circuitBreakerOpen: boolean;
+  circuitReason: string;
   consecutiveLosses: number;
   openPositions: number;
+  compoundingReserveSol: number;
 }
 
 const clamp = (value: number, low: number, high: number): number => Math.max(low, Math.min(high, value));
@@ -55,9 +66,11 @@ export class RiskManager {
   dayPeakEquitySol: number;
   maxDrawdownPct = 0;
   dailyDrawdownPct = 0;
+  dailyPnlSol = 0;
   circuitBreakerOpen = false;
   circuitReason = "";
   consecutiveLosses = 0;
+  compoundingReserveSol = 0;
   openPositions = new Map<string, PositionRecord>();
   rollingReturns: number[] = [];
 
@@ -80,9 +93,6 @@ export class RiskManager {
       return this.rejected("duplicate_mint_position", signal.regime);
     }
     const uncertaintyStd = signal.rugUncertaintyStd ?? 0;
-    if (uncertaintyStd > 0.10) {
-      return this.rejected("model_uncertainty_review", signal.regime);
-    }
     if (signal.riskProbability > 0.15 && uncertaintyStd < 0.05) {
       return this.rejected("risk_probability_block", signal.regime);
     }
@@ -92,6 +102,7 @@ export class RiskManager {
 
     const equity = this.equitySol();
     const cluster = this.clusterFor(signal.launchPlatform);
+    const platform = this.platformFor(signal.launchPlatform);
     const exposureAfterMinimum = this.openExposureSol() + this.config.minTradeSol;
     if (equity <= 0 || exposureAfterMinimum / equity > this.config.maxTotalExposureFraction) {
       return this.rejected("total_exposure_cap", signal.regime);
@@ -99,6 +110,13 @@ export class RiskManager {
     const clusterExposureAfterMinimum = this.clusterExposureSol(cluster) + this.config.minTradeSol;
     if (equity <= 0 || clusterExposureAfterMinimum / equity > this.config.maxClusterExposureFraction) {
       return this.rejected("cluster_exposure_cap", signal.regime);
+    }
+    const platformLimit = this.config.maxPositionPerPlatform[platform] ?? this.config.maxPositionPerPlatform.other ?? 0.2;
+    if (equity <= 0 || (this.platformExposureSol(platform) + this.config.minTradeSol) / equity > platformLimit) {
+      return this.rejected("platform_exposure_cap", signal.regime);
+    }
+    if (signal.deployer && this.deployerPositionCount(signal.deployer) >= this.config.maxDeployerPositions) {
+      return this.rejected("deployer_concentration_cap", signal.regime);
     }
 
     const kelly = this.kelly(signal.winProbability, signal.rewardRiskRatio);
@@ -108,13 +126,20 @@ export class RiskManager {
     const regimeFactor = this.regimeFactor(signal.regime);
     const confidence = clamp(signal.mlConfidence, 0, 1);
     const clusterPenalty = this.clusterPenalty(cluster);
+    const uncertaintyPenalty = uncertaintyStd > 0.08 ? 0.5 : 1;
     const tailRiskFactor = (signal.memeVolatilityIndex ?? signal.volatility) > this.config.tailRiskVolatilityThreshold ? 0.5 : 1;
-    const positionFraction = clamp(kelly * this.config.kellyFraction * regimeFactor * confidence * clusterPenalty * tailRiskFactor, 0, this.config.maxPositionFraction);
+    const alphaBoost = this.alphaBoost(signal);
+    const compoundingFactor = this.compoundingFactor(signal, equity);
+    const positionFraction = clamp(kelly * this.config.kellyFraction * regimeFactor * confidence * clusterPenalty * uncertaintyPenalty * tailRiskFactor * alphaBoost * compoundingFactor, 0, this.config.maxPositionFraction);
     const maxByExposure = Math.max(0, equity * this.config.maxTotalExposureFraction - this.openExposureSol());
     const maxByCluster = Math.max(0, equity * this.config.maxClusterExposureFraction - this.clusterExposureSol(cluster));
+    const maxByPlatform = Math.max(0, equity * platformLimit - this.platformExposureSol(platform));
     const maxByCapital = equity * this.config.maxPositionFraction;
-    const maxByLiquidity = Math.max(this.config.minTradeSol, signal.liquiditySol * 0.018);
-    const amountSol = Math.min(equity * positionFraction, maxByExposure, maxByCluster, maxByCapital, maxByLiquidity, this.cashSol);
+    const liquidityFraction = (signal.volumeBottleneckRatio ?? 0) >= 0.55
+      ? this.config.volumeBottleneckLiquidityFraction
+      : this.config.maxLiquidityPositionFraction;
+    const maxByLiquidity = Math.max(this.config.minTradeSol, signal.liquiditySol * liquidityFraction);
+    const amountSol = Math.min(equity * positionFraction, maxByExposure, maxByCluster, maxByPlatform, maxByCapital, maxByLiquidity, this.cashSol);
 
     if (amountSol < this.config.minTradeSol) {
       return this.rejected("below_min_trade_size", signal.regime);
@@ -145,6 +170,13 @@ export class RiskManager {
     this.openPositions.delete(mint);
     this.cashSol += position.amountSol + pnlSol;
     this.realizedPnlSol += pnlSol;
+    this.dailyPnlSol += pnlSol;
+    if (pnlSol > 0) {
+      const cap = this.equitySol() * this.config.compoundingMaxReserveFraction;
+      this.compoundingReserveSol = Math.min(cap, this.compoundingReserveSol + pnlSol * this.config.compoundingReinvestWinPct);
+    } else if (pnlSol < 0) {
+      this.compoundingReserveSol = Math.max(0, this.compoundingReserveSol + pnlSol);
+    }
     this.rollingReturns.push(pnlSol / Math.max(position.amountSol, 1e-9));
     if (this.rollingReturns.length > 120) {
       this.rollingReturns.shift();
@@ -163,8 +195,10 @@ export class RiskManager {
       maxDrawdownPct: this.maxDrawdownPct,
       dailyDrawdownPct: this.dailyDrawdownPct,
       circuitBreakerOpen: this.circuitBreakerOpen,
+      circuitReason: this.circuitReason,
       consecutiveLosses: this.consecutiveLosses,
-      openPositions: this.openPositions.size
+      openPositions: this.openPositions.size,
+      compoundingReserveSol: this.compoundingReserveSol
     };
   }
 
@@ -199,6 +233,26 @@ export class RiskManager {
     return output;
   }
 
+  platformExposureSol(platform: string): number {
+    let total = 0;
+    for (const position of this.openPositions.values()) {
+      if (this.platformFor(position.platform || position.cluster) === platform) {
+        total += position.amountSol;
+      }
+    }
+    return total;
+  }
+
+  deployerPositionCount(deployer: string): number {
+    let count = 0;
+    for (const position of this.openPositions.values()) {
+      if (position.deployer === deployer) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
   realizedVolatility(): number {
     if (this.rollingReturns.length < 2) {
       return 0;
@@ -211,6 +265,7 @@ export class RiskManager {
   resetDailyPeak(): void {
     this.dayPeakEquitySol = this.equitySol();
     this.dailyDrawdownPct = 0;
+    this.dailyPnlSol = 0;
   }
 
   updateCircuitBreakers(volatility: number): void {
@@ -219,6 +274,8 @@ export class RiskManager {
       this.openCircuit("max_drawdown");
     } else if (this.dailyDrawdownPct >= this.config.dailyDrawdownCircuitBreakerPct) {
       this.openCircuit("daily_drawdown");
+    } else if (this.dailyPnlSol <= -Math.abs(this.config.dailyLossLimitSol)) {
+      this.openCircuit("daily_loss_limit");
     } else if (volatility >= this.config.volatilitySpikeBlock) {
       this.openCircuit("volatility_spike");
     } else if (this.consecutiveLosses >= this.config.consecutiveLossCircuitBreaker) {
@@ -255,15 +312,15 @@ export class RiskManager {
 
   regimeFactor(regime: MarketRegime): number {
     if (regime === "stress") {
-      return 0.34;
+      return 0.25;
     }
     if (regime === "caution") {
-      return 0.62;
+      return 0.5;
     }
     if (regime === "burst") {
-      return 0.86;
+      return 0.75;
     }
-    return 0.74;
+    return 0.6;
   }
 
   dynamicStop(regime: MarketRegime, volatility: number): number {
@@ -286,7 +343,25 @@ export class RiskManager {
     if (count < this.config.correlationClusterPositionThreshold) {
       return 1;
     }
-    return clamp(1 - (count - this.config.correlationClusterPositionThreshold + 1) * 0.18, 0.4, 1);
+    return clamp(1 - (count - this.config.correlationClusterPositionThreshold + 1) * 0.25, 0.25, 1);
+  }
+
+  alphaBoost(signal: RiskSignal): number {
+    const alpha = clamp(signal.memeAlphaScore ?? 0.55, 0, 1);
+    const whale = clamp(signal.whaleAccumulationScore ?? 0, 0, 1);
+    const retail = clamp(signal.retailFomoScore ?? 0, 0, 1);
+    const fomoPenalty = clamp(retail - whale, 0, 1) * 0.45;
+    return 1 + this.config.highAlphaKellyBoost * clamp((alpha - 0.55) / 0.45, 0, 1) * (1 - fomoPenalty);
+  }
+
+  compoundingFactor(signal: RiskSignal, equity: number): number {
+    const alpha = signal.memeAlphaScore ?? 0;
+    const bottleneck = signal.volumeBottleneckRatio ?? 0;
+    if (alpha < 0.65 || bottleneck < 0.55 || equity <= 0 || this.compoundingReserveSol <= 0) {
+      return 1;
+    }
+    const reserveBoost = Math.min(this.config.compoundingMaxBoost, this.compoundingReserveSol / equity);
+    return 1 + reserveBoost * (0.5 + clamp(bottleneck, 0, 1) * 0.5);
   }
 
   clusterFor(value: string | undefined): string {
@@ -301,6 +376,17 @@ export class RiskManager {
       return "moonshot";
     }
     return normalized || "unknown";
+  }
+
+  platformFor(value: string | undefined): string {
+    const normalized = String(value || "other").toLowerCase();
+    if (normalized.includes("pump")) {
+      return "pump_fun";
+    }
+    if (normalized.includes("raydium")) {
+      return "raydium";
+    }
+    return "other";
   }
 
   rejected(reason: string, regime: MarketRegime): PositionPlan {

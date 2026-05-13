@@ -127,7 +127,8 @@ export class PositionManager {
         openedAt: position.openedAt,
         now,
         maxHoldMs: position.maxHoldMs,
-        timeToRugHours: position.timeToRugHours
+        timeToRugHours: position.timeToRugHours,
+        circuitBreakerOpen: this.risk.snapshot().circuitBreakerOpen
       });
       if (decision.shouldExit) {
         await this.exit(position, decision, quote);
@@ -161,7 +162,7 @@ export class PositionManager {
     }
     const raw = await this.redis.hgetall("positions:open");
     for (const [mint, value] of Object.entries(raw)) {
-      this.positions.set(mint, JSON.parse(String(value)) as ManagedPosition);
+      this.positions.set(mint, JSON.parse(value) as ManagedPosition);
     }
   }
 

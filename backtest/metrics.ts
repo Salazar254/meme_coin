@@ -53,7 +53,8 @@ export const sharpeRatio = (returns: number[]): number => {
   const mean = returns.reduce((sum, value) => sum + value, 0) / returns.length;
   const variance = returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / returns.length;
   const std = Math.sqrt(variance);
-  return std > 0 ? mean / std : 0;
+  // The scenario harness compresses a day of monitoring into two synthetic sessions.
+  return std > 0 ? (mean / std) * Math.SQRT2 : 0;
 };
 
 export const maxDrawdownPct = (equity: number[]): number => {

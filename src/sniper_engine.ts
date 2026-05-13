@@ -4,6 +4,8 @@ import { RiskManager } from "./risk_manager.ts";
 import type { Logger } from "./utils/logger.ts";
 import { JitoClient } from "./utils/jito_client.ts";
 import { WalletRotator, type WalletRef } from "./wallet_rotator.ts";
+import { MemeAlphaAgent } from "./meme_alpha/meme_alpha_agent.ts";
+import type { SocialPost } from "./meme_alpha/sentiment_engine.ts";
 
 export interface SwapBundleRequest {
   event: TokenLaunchEvent;
@@ -47,6 +49,7 @@ export class SniperEngine {
   risk: RiskManager;
   wallets: WalletRotator;
   jito: JitoClient;
+  memeAlpha?: MemeAlphaAgent;
   logger: Logger;
   buildSwapBundle?: SwapBundleBuilder;
   queue: TokenLaunchEvent[] = [];
@@ -60,12 +63,13 @@ export class SniperEngine {
     failed: 0
   };
 
-  constructor(config: BotConfig, scorer: TokenRiskScorer, logger: Logger, buildSwapBundle?: SwapBundleBuilder) {
+  constructor(config: BotConfig, scorer: TokenRiskScorer, logger: Logger, buildSwapBundle?: SwapBundleBuilder, memeAlpha?: MemeAlphaAgent) {
     this.config = config;
     this.scorer = scorer;
     this.risk = new RiskManager(config.risk);
     this.wallets = new WalletRotator(config.wallets, logger);
     this.jito = new JitoClient(config.jito, logger);
+    this.memeAlpha = memeAlpha ?? (config.memeAlpha.enabled ? new MemeAlphaAgent(config.memeAlpha, logger) : undefined);
     this.logger = logger.child({ component: "sniper_engine" });
     this.buildSwapBundle = buildSwapBundle;
   }
@@ -97,6 +101,10 @@ export class SniperEngine {
     return true;
   }
 
+  ingestSocialPost(post: SocialPost): void {
+    this.memeAlpha?.ingestSocialPost(post);
+  }
+
   async drain(): Promise<void> {
     while (this.queue.length > 0) {
       await this.processBatch();
@@ -125,46 +133,71 @@ export class SniperEngine {
   async processEvent(event: TokenLaunchEvent): Promise<TradeReceipt | undefined> {
     this.stats.processed += 1;
     try {
-      const riskResult = await this.scorer.evaluate(event);
+      let candidate = event;
+      if (this.memeAlpha) {
+        const alpha = await this.memeAlpha.evaluate(event);
+        if (!alpha.accepted) {
+          this.stats.rejected += 1;
+          this.logger.debug({ mint: event.mint, score: alpha.score, reasons: alpha.reasons }, "meme_alpha_rejected");
+          return undefined;
+        }
+        candidate = alpha.enrichedEvent;
+        this.logger.debug({
+          mint: candidate.mint,
+          score: alpha.score,
+          confidence: alpha.confidence,
+          auditMs: alpha.audit.elapsedMs,
+          sentimentSamples: alpha.sentiment.samples
+        }, "meme_alpha_accepted");
+      }
+
+      const riskResult = await this.scorer.evaluate(candidate);
       if (!riskResult.accepted) {
         this.stats.rejected += 1;
-        this.logger.debug({ mint: event.mint, reasons: riskResult.reasons, riskProbability: riskResult.riskProbability }, "token_rejected");
+        this.logger.debug({ mint: candidate.mint, reasons: riskResult.reasons, riskProbability: riskResult.riskProbability }, "token_rejected");
         return undefined;
       }
 
       const plan = this.risk.planPosition({
-        mint: event.mint,
-        timestamp: event.timestamp,
+        mint: candidate.mint,
+        timestamp: candidate.timestamp,
         regime: riskResult.regime,
         riskProbability: riskResult.riskProbability,
         mlConfidence: riskResult.mlConfidence,
-        winProbability: event.predictedWinProb,
-        rewardRiskRatio: event.rewardRiskRatio,
-        liquiditySol: event.liquiditySol,
-        volatility: event.volatility1m,
-        launchPlatform: event.launchPlatform,
+        winProbability: candidate.predictedWinProb,
+        rewardRiskRatio: candidate.rewardRiskRatio,
+        liquiditySol: candidate.liquiditySol,
+        volatility: candidate.volatility1m,
+        deployer: candidate.deployer,
+        launchPlatform: candidate.launchPlatform,
         rugUncertaintyStd: riskResult.uncertainty,
-        memeVolatilityIndex: event.memeVolatilityIndex
+        memeVolatilityIndex: candidate.memeVolatilityIndex,
+        memeAlphaScore: candidate.memeAlphaScore,
+        whaleAccumulationScore: candidate.whaleAccumulationScore,
+        retailFomoScore: candidate.retailFomoScore,
+        volumeBottleneckRatio: candidate.volumeBottleneckRatio
       });
 
       if (!plan.accepted) {
         this.stats.rejected += 1;
-        this.logger.debug({ mint: event.mint, reason: plan.reason }, "position_rejected");
+        this.logger.debug({ mint: candidate.mint, reason: plan.reason }, "position_rejected");
         return undefined;
       }
 
       this.stats.accepted += 1;
       const wallet = this.wallets.nextWallet();
-      await this.wallets.publishAllocation(wallet, event.mint, plan.amountSol);
+      await this.wallets.publishAllocation(wallet, candidate.mint, plan.amountSol);
       this.risk.recordEntry({
-        mint: event.mint,
+        mint: candidate.mint,
         amountSol: plan.amountSol,
         openedAt: Date.now(),
         riskMode: plan.riskMode,
-        cluster: event.launchPlatform
+        cluster: candidate.launchPlatform,
+        platform: candidate.launchPlatform,
+        deployer: candidate.deployer
       });
 
-      const receipt = await this.execute(event, wallet, plan.amountSol, plan.stopLossPct, plan.takeProfitPct);
+      const receipt = await this.execute(candidate, wallet, plan.amountSol, plan.stopLossPct, plan.takeProfitPct);
       this.wallets.complete(wallet.id);
       return receipt;
     } catch (error) {

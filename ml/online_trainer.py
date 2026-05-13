@@ -20,7 +20,7 @@ class DriftResult:
     shifted: bool
 
 
-def exponential_weight(timestamp_ms: int, now_ms: int, decay: float = 0.95) -> float:
+def exponential_weight(timestamp_ms: int, now_ms: int, decay: float = 0.93) -> float:
     days_ago = max(0.0, (now_ms - timestamp_ms) / 86_400_000.0)
     return decay ** days_ago
 
@@ -80,12 +80,14 @@ def build_weekly_job_manifest(
         "fine_tune": {
             "freeze_backbone": True,
             "learning_rate": 1e-4,
-            "weighting": "0.95^days_ago",
+            "max_epochs": 50,
+            "discard_if_val_auc_below": 0.75,
+            "weighting": "0.93^days_ago",
             "samples_last_30d": len(rows),
         },
         "ab_test": {
             "mode": "shadow",
-            "duration_days": 7,
+            "duration_hours": 72,
             "promote_if": ["lower_log_loss", "no_drift_alarm", "pnl_drawdown_not_worse"],
         },
     }

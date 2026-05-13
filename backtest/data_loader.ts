@@ -4,7 +4,7 @@ import { extname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import type { TokenLaunchEvent } from "../src/token_risk_scorer.ts";
 
-export type HistoricalLaunchEvent = Omit<TokenLaunchEvent, "futureReturnPct"> & {
+export type HistoricalLaunchEvent = TokenLaunchEvent & {
   launchPlatform?: "pump.fun" | "raydium" | "moonshot" | "unknown" | string;
   entryPriceSol?: number;
   baseReserveSol?: number;

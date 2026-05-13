@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 try:
+    import numpy as np
     import torch
     from torch import nn
     from torch.utils.data import DataLoader, Dataset
@@ -110,14 +111,17 @@ def pretrain_deployer_embeddings(
     lr: float = 1e-3,
 ) -> dict[str, object]:
     data = list(outcomes)
-    deployers = sorted({item.deployer for item in data})
-    deployer_to_id = {deployer: index for index, deployer in enumerate(deployers)}
+    deployers = sorted({item.deployer for item in data})[:49_999]
+    allowed_deployers = set(deployers)
+    data = [item for item in data if item.deployer in allowed_deployers]
+    deployer_to_id = {"__unknown__": 0}
+    deployer_to_id.update({deployer: index + 1 for index, deployer in enumerate(deployers)})
     dataset = TripletDeployerDataset(data, deployer_to_id)
     if len(dataset) == 0:
         raise ValueError("not_enough_deployer_triplets")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DeployerEncoder(max(len(deployers), 1)).to(device)
+    model = DeployerEncoder(max(len(deployer_to_id), 1)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     criterion = nn.TripletMarginLoss(margin=0.35)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -147,8 +151,16 @@ def pretrain_deployer_embeddings(
         },
         output_path,
     )
+    matrix = model.embedding.weight.detach().cpu().numpy().astype(np.float32)
+    npy_path = output_path[:-3] + ".npy" if output_path.endswith(".pt") else output_path
+    np.save(npy_path, matrix)
+    lookup_path = os.path.join(os.path.dirname(output_path), "deployer_lookup.json")
+    with open(lookup_path, "w", encoding="utf-8") as handle:
+        json.dump(deployer_to_id, handle, indent=2)
     return {
         "output_path": output_path,
+        "npy_path": npy_path,
+        "lookup_path": lookup_path,
         "num_deployers": len(deployers),
         "triplets": len(dataset),
         "final_loss": history[-1],
@@ -159,7 +171,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="JSONL deployer outcome history")
     parser.add_argument("--output", default="models/deployer_embeddings.pt")
-    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--epochs", type=int, default=10)
     args = parser.parse_args()
     summary = pretrain_deployer_embeddings(load_outcomes(args.input), args.output, args.epochs)
     print(json.dumps(summary, indent=2))
