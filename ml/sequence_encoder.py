@@ -24,7 +24,7 @@ SEQUENCE_FEATURES = [
 
 
 class SequenceEncoder(nn.Module):
-    """Encode {SEQUENCE_LENGTH} hourly snapshots into a compact temporal embedding."""
+    """Encode 16 hourly snapshots into a compact temporal embedding."""
 
     def __init__(self, input_dim: int = 6, hidden_dim: int = 16, num_layers: int = 2):
         super().__init__()
